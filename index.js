@@ -2,7 +2,7 @@ require('dotenv').config();
 const { Telegraf } = require('telegraf');
 const OgsClient = require('./ogs-client');
 const Storage = require('./storage');
-const config = require('./config.example.json');
+const config = require('./config.json');
 
 const BOT_TOKEN = process.env.TELEGRAM_TOKEN;
 if (!BOT_TOKEN) {
@@ -102,7 +102,7 @@ bot.command('listusers', (ctx) => {
 (async () => {
   // если хотите — заранее заполните storage.trackedPlayers:
   // storage.addPlayer(12345); ...
-  // или загружайте из config.example.json:
+  // или загружайте из config.json:
   (config.trackedPlayers || []).forEach(id => storage.addPlayer(id));
 
   // восстановление текущего состояния через REST
