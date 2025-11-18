@@ -1,121 +1,114 @@
-require('dotenv').config();
-const { Telegraf } = require('telegraf');
-const OgsClient = require('./ogs-client');
-const Storage = require('./storage');
-const config = require('./config.json');
+require("dotenv").config();
+const axios = require("axios");
+const { Telegraf } = require("telegraf");
+const config = require("./config.json");
 
 const BOT_TOKEN = process.env.TELEGRAM_TOKEN;
+const OWNER = config.ownerTelegramId;
+
 if (!BOT_TOKEN) {
-  console.error('Установите TELEGRAM_TOKEN в .env или окружении.');
+  console.error("Нет TELEGRAM_TOKEN в .env");
   process.exit(1);
 }
 
-const OWNER = config.ownerTelegramId; // ваш telegram ID
-const storage = new Storage(process.env.STORAGE_PATH || null); // null -> только в памяти
-const ogs = new OgsClient();
-
 const bot = new Telegraf(BOT_TOKEN);
 
-// helpers
-function isBetweenTrackedPlayers(game, trackedSet) {
-  // структура игры зависит от API; тут примерная проверка
-  try {
-    const p1 = game.players?.white?.id;
-    const p2 = game.players?.black?.id;
-    if (!p1 || !p2) return false;
-    return trackedSet.has(p1) && trackedSet.has(p2);
-  } catch {
-    return false;
-  }
+// ===========================
+// УТИЛИТЫ
+// ===========================
+
+function delay(ms) {
+  return new Promise((res) => setTimeout(res, ms));
 }
 
-// восстановление состояния: получить все активные игры для каждого отслеживаемого
-async function restoreState() {
-  const tracked = storage.getPlayers();
-  if (!tracked.length) {
-    console.log('Tracked list empty at startup.');
-    return;
-  }
-  const trackedSet = new Set(tracked.map(Number));
-  const found = new Set();
-  for (const pid of tracked) {
-    const games = await ogs.fetchActiveGamesForPlayer(pid);
-    for (const g of games) {
-      if (isBetweenTrackedPlayers(g, trackedSet)) {
-        found.add(g.id);
-      }
-    }
-  }
-  for (const gid of found) storage.addGame(gid);
-  console.log('restoreState done, games:', Array.from(found));
+function isToday(dateStr) {
+  const d = new Date(dateStr);
+  const t = new Date();
+
+  return (
+    d.getFullYear() === t.getFullYear() &&
+    d.getMonth() === t.getMonth() &&
+    d.getDate() === t.getDate()
+  );
 }
 
-// реакция на сообщение RT от OGS
-async function handleRealtimeMessage(msg) {
-  // msg формат зависит от OGS RT — на форуме и в доках пишут, что сообщения бывают разными.
-  // Простейшая идея: при получении события о новой/закрытой игре — проверяем участников.
+// ===========================
+// ОПРОС API OGS
+// ===========================
+
+async function fetchGames(playerId) {
+  const url = `https://online-go.com/api/v1/players/${playerId}/games`;
+
   try {
-    if (!msg || typeof msg !== 'object') return;
-    // возможный формат: {type:'gameStarted', game: {...}} — зависит от RT
-    const type = msg.type || msg.name || msg.action;
-    if (!type) return;
-
-    const trackedSet = new Set(storage.getPlayers().map(Number));
-
-    if (type === 'game_started' || type === 'gameStarted') {
-      const game = msg.game || msg;
-      if (isBetweenTrackedPlayers(game, trackedSet) && !storage.hasGame(game.id)) {
-        storage.addGame(game.id);
-        const text = `Игра началась между ${game.players.white?.username} и ${game.players.black?.username}\nID: ${game.id}`;
-        await bot.telegram.sendMessage(OWNER, text);
-      }
-    }
-
-    if (type === 'game_ended' || type === 'gameEnded' || type === 'game_over') {
-      const game = msg.game || msg;
-      if (storage.hasGame(game.id)) {
-        storage.removeGame(game.id);
-        const text = `Игра закончена: ${game.id} — ${game.players.white?.username} vs ${game.players.black?.username}`;
-        await bot.telegram.sendMessage(OWNER, text);
-      }
-    }
+    const r = await axios.get(url);
+    return r.data.results || [];
   } catch (e) {
-    console.warn('handleRealtimeMessage error', e.message);
+    const status = e.response?.status;
+
+    if (status === 500 || status === 503) {
+      console.log(`OGS отдал ${status} для ${playerId}, пропускаю...`);
+    } else {
+      console.log(`Ошибка OGS для ${playerId}:`, status);
+    }
+
+    return [];
   }
 }
 
-// команды бота
-bot.start((ctx) => ctx.reply('OGS watcher бот запущен.'));
-bot.command('adduser', (ctx) => {
-  if (!config.allowAddUsers) return ctx.reply('Добавление пользователей отключено.');
-  const args = ctx.message.text.split(' ').slice(1);
-  if (!args[0]) return ctx.reply('Использование: /adduser <ogs_id>');
-  const id = Number(args[0]);
-  storage.addPlayer(id);
-  ctx.reply(`Добавлен игрок ${id}`);
-});
-bot.command('listusers', (ctx) => {
-  ctx.reply(`Отслеживаемые OGS ID:\n${storage.getPlayers().join('\n') || '(пусто)'}`);
-});
+// ===========================
+// ЛОГИКА ПРОВЕРКИ НОВЫХ ИГР
+// ===========================
 
-// main
+const announcedGames = new Set(); // чтобы не спамить
+
+async function checkAllPlayers() {
+  const players = config.trackedPlayers;
+
+  for (const pid of players) {
+    const games = await fetchGames(pid);
+    await delay(800);
+
+    for (const g of games) {
+      // фильтрация по дате
+      if (!isToday(g.ended)) continue;
+
+      if (announcedGames.has(g.id)) continue;
+      announcedGames.add(g.id);
+
+      const msg =
+        `Найдена новая игра сегодня!\n` +
+        `Игрок: ${pid}\n` +
+        `Против: ${g.opponent?.username || "???"}\n` +
+        `Результат: ${g.outcome}\n\n` +
+        `Ссылка: https://online-go.com/game/${g.id}`;
+
+      await bot.telegram.sendMessage(OWNER, msg);
+    }
+  }
+}
+
+// ===========================
+// СТАРТ БОТА
+// ===========================
+
+bot.start((ctx) => ctx.reply("Бот работает."));
+
 (async () => {
-  // если хотите — заранее заполните storage.trackedPlayers:
-  // storage.addPlayer(12345); ...
-  // или загружайте из config.json:
-  (config.trackedPlayers || []).forEach(id => storage.addPlayer(id));
+  console.log("Запускаем бота...");
 
-  // восстановление текущего состояния через REST
-  await restoreState();
+  await bot.launch();
+  console.log("Bot started");
 
-  // подключение к RT API
-  ogs.connectRealtime(handleRealtimeMessage);
+  // приветствие
+  try {
+    await bot.telegram.sendMessage(OWNER, "Бот запущен! 🚀");
+  } catch {}
 
-  // запускаем телеграм бота
-  bot.launch();
-  console.log('Bot started');
+  // запуск периодического опроса
+  setInterval(checkAllPlayers, 30 * 60 * 1000); // каждые 30 мин
+  checkAllPlayers(); // сразу первый прогон
 })();
 
-// graceful shutdown
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
+process.once("SIGINT", () => bot.stop("SIGINT"));
+process.once("SIGTERM", () => bot.stop("SIGTERM"));
+
